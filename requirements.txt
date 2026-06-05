@@ -1,7 +1,10 @@
-streamlit
-streamlit-js-eval
-firebase-admin
-PyGithub
-Pillow
-pandas
-requests
+streamlit>=1.32
+pandas>=2.0
+Pillow>=10.0
+requests>=2.31
+PyGithub>=2.1
+firebase-admin>=6.4
+geonamescache>=2.0
+folium>=0.16
+streamlit-folium>=0.20
+streamlit-js-eval>=0.1.7
