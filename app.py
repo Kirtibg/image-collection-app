@@ -1,36 +1,26 @@
 import streamlit as st
 import streamlit.components.v1 as components
-import os
 import json
-import pandas as pd
-from streamlit_js_eval import streamlit_js_eval
-from PIL import Image
-import io
 import base64
-import time
 from io import BytesIO
-from io import StringIO
-from github import Github
+from PIL import Image
 import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import firestore
 import requests
-import uuid
-import re
-
-# New imports for city search + interactive map
+import tempfile
+import pathlib
 import geonamescache
-import folium
-from streamlit_folium import st_folium
 
 country = 'India'
 continent = 'Asia'
-country_code = 'IN'  # ISO code used to filter GeoNames cities
 
 firebase_secrets = st.secrets["firebase"]
 token = firebase_secrets["github_token"]
 repo_name = firebase_secrets["github_repo"]
 owner, repo_name = repo_name.split('/')
+maps_api_key = firebase_secrets["Maps_API_KEY"]  # add this under [firebase] in secrets
+
 # Convert secrets to dict
 cred_dict = {
     "type": firebase_secrets["type"],
@@ -46,15 +36,16 @@ cred_dict = {
     "universe_domain": firebase_secrets["universe_domain"]
 }
 cred = credentials.Certificate(json.loads(json.dumps(cred_dict)))
-# Initialize Firebase (only if not already initialized)
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 
-# Get Firestore client
 db = firestore.client()
 
+# Rough country centroid used as the map's default center
+COUNTRY_CENTER = (22.0, 79.0)
 
-# ---- CITY DATA (GeoNames via geonamescache) ----
+
+# ---- CITY LIST (GeoNames via geonamescache) ----
 @st.cache_data(show_spinner=False)
 def load_cities(cc):
     """Return {city_name: (lat, lng)} for the given country code, sorted by name."""
@@ -64,15 +55,174 @@ def load_cities(cc):
     for c in cities.values():
         if c.get("countrycode") == cc:
             name = c["name"]
-            # keep the first occurrence's coordinates if names duplicate
-            if name not in data:
+            if name not in data:  # keep first occurrence if duplicate names
                 data[name] = (float(c["latitude"]), float(c["longitude"]))
     return dict(sorted(data.items(), key=lambda x: x[0].lower()))
 
-CITIES = load_cities(country_code)
-# Rough country centroid used when no city is selected / city is typed manually
-COUNTRY_CENTER = (22.0, 79.0)
-COUNTRY_ZOOM = 5
+CITIES = load_cities("IN")
+CITY_NAMES = list(CITIES.keys())
+
+
+# ---- GOOGLE MAPS PICKER (optional, bidirectional custom component) ----
+# Geocoding-based search (no Places API needed) + click/drag pin.
+# Returns {lat, lng, address}. Map center/zoom are passed in as component args.
+_GMAPS_HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  body { margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
+  .row { display: flex; gap: 6px; margin-bottom: 6px; }
+  #search { flex: 1; box-sizing: border-box; padding: 9px 10px; font-size: 14px;
+            border: 1px solid #ccc; border-radius: 6px; }
+  #searchBtn { padding: 9px 14px; font-size: 14px; border: none; border-radius: 6px;
+               background: #1a73e8; color: #fff; cursor: pointer; }
+  #map { width: 100%; height: 320px; border-radius: 8px; }
+  #info { font-size: 13px; padding: 6px 2px; color: #444; }
+</style>
+</head>
+<body>
+  <div class="row">
+    <input id="search" type="text" placeholder="Search a place, then press Enter or Search…" />
+    <button id="searchBtn">Search</button>
+  </div>
+  <div id="map"></div>
+  <div id="info">Search above, or click / drag the marker to set the exact spot.</div>
+
+<script>
+  function _send(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data), "*");
+  }
+  function setComponentValue(v) { _send("streamlit:setComponentValue", { value: v }); }
+  function setFrameHeight(h)   { _send("streamlit:setFrameHeight", { height: h }); }
+  function ready()            { _send("streamlit:componentReady", { apiVersion: 1 }); }
+
+  var map, marker, geocoder, mapReady = false, pendingCenter = null, pendingZoom = null, lastCenterKey = null;
+  var DEFAULT = { lat: __LAT__, lng: __LNG__ };
+
+  function emit(latLng, address) {
+    setComponentValue({ lat: latLng.lat(), lng: latLng.lng(), address: address || "" });
+  }
+
+  function placeMarker(latLng) {
+    if (!marker) {
+      marker = new google.maps.Marker({ position: latLng, map: map, draggable: true });
+      marker.addListener("dragend", function (e) { reverseAndEmit(e.latLng); });
+    } else {
+      marker.setPosition(latLng);
+    }
+  }
+
+  function reverseAndEmit(latLng) {
+    geocoder.geocode({ location: latLng }, function (results, status) {
+      var addr = (status === "OK" && results[0]) ? results[0].formatted_address : "";
+      document.getElementById("info").textContent = addr
+        ? ("Selected: " + addr)
+        : ("Selected: " + latLng.lat().toFixed(6) + ", " + latLng.lng().toFixed(6));
+      emit(latLng, addr);
+    });
+  }
+
+  function doSearch() {
+    var q = document.getElementById("search").value;
+    if (!q) return;
+    geocoder.geocode({ address: q, componentRestrictions: { country: "IN" } }, function (results, status) {
+      if (status === "OK" && results[0]) {
+        var loc = results[0].geometry.location;
+        if (results[0].geometry.viewport) map.fitBounds(results[0].geometry.viewport);
+        else { map.setCenter(loc); map.setZoom(15); }
+        placeMarker(loc);
+        document.getElementById("info").textContent = "Selected: " + results[0].formatted_address;
+        emit(loc, results[0].formatted_address);
+      } else {
+        document.getElementById("info").textContent = "No results for that search.";
+      }
+    });
+  }
+
+  function applyCenter() {
+    if (mapReady && pendingCenter) {
+      map.setCenter(pendingCenter);
+      if (pendingZoom) map.setZoom(pendingZoom);
+    }
+  }
+
+  function onRender(event) {
+    var args = (event.data && event.data.args) || {};
+    if (args.center) {
+      var key = args.center.lat + "," + args.center.lng + "," + args.zoom;
+      if (key !== lastCenterKey) {  // only recenter when the chosen city changes
+        lastCenterKey = key;
+        pendingCenter = args.center;
+        pendingZoom = args.zoom;
+        applyCenter();
+      }
+    }
+  }
+  window.addEventListener("message", function (e) {
+    if (e.data && e.data.type === "streamlit:render") onRender(e);
+  });
+
+  function initMap() {
+    geocoder = new google.maps.Geocoder();
+    map = new google.maps.Map(document.getElementById("map"), {
+      center: DEFAULT, zoom: 5, streetViewControl: false, mapTypeControl: false
+    });
+    mapReady = true;
+    applyCenter();
+
+    map.addListener("click", function (e) { placeMarker(e.latLng); reverseAndEmit(e.latLng); });
+    document.getElementById("searchBtn").addEventListener("click", doSearch);
+    document.getElementById("search").addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { e.preventDefault(); doSearch(); }
+    });
+    setFrameHeight(430);
+  }
+
+  window.initMap = initMap;
+  ready();
+  setFrameHeight(430);
+</script>
+<script async src="https://maps.googleapis.com/maps/api/js?key=__API_KEY__&callback=initMap"></script>
+</body>
+</html>
+"""
+
+_COMPONENT_DIR = pathlib.Path(tempfile.gettempdir()) / "gmaps_picker_component"
+_COMPONENT_DIR.mkdir(exist_ok=True)
+_html = (_GMAPS_HTML_TEMPLATE
+         .replace("__API_KEY__", maps_api_key)
+         .replace("__LAT__", str(COUNTRY_CENTER[0]))
+         .replace("__LNG__", str(COUNTRY_CENTER[1])))
+(_COMPONENT_DIR / "index.html").write_text(_html, encoding="utf-8")
+
+_gmaps_component = components.declare_component("gmaps_picker", path=str(_COMPONENT_DIR))
+
+def gmaps_picker(center, zoom, key):
+    """center=(lat,lng). Returns {'lat','lng','address'} once a spot is set, else None."""
+    return _gmaps_component(
+        default=None,
+        center={"lat": center[0], "lng": center[1]},
+        zoom=zoom,
+        key=key,
+    )
+
+
+# ---- Radio label helpers ----
+def fmt_rating(x):
+    return {
+        0: "No evidence at all",
+        1: f"There are visual indications like architectural style, vegetation, etc., but I do not know if they are specific to {country} or {continent}",
+        2: f"A few features that are shared by multiple countries within {continent}, but not fully specific to {country}",
+        3: f"Enough evidence specific to {country}",
+    }[x]
+
+def fmt_pop(x):
+    return {
+        0: "The location depicts only a regular scene",
+        1: "The location may be locally popular, but not country-wide",
+        2: "The location is popular country-wide",
+    }[x]
 
 
 # ---- SESSION STATE ----
@@ -96,8 +246,8 @@ Following are the instructions for the same.
 - Photos should depict a variety of surroundings within {country}.
 - Avoid uploading duplicate/near-duplicate photos that you have already uploaded.
 - Ensure the images are clear and well-lit.
-- Outdoor scenes are preferred.
-- Avoid uploading images with identifiable faces and license plates to protect privacy.
+- Upload outdoor scenes only (no indoor photos).
+- Avoid uploading images with identifiable faces to protect privacy.
 
 **Image Requirements**:
 
@@ -110,12 +260,13 @@ Following are the instructions for the same.
 2.  For each image:
     -   Wait for the photo to appear on screen.
     -   **Confirm** that the photo is outdoors and contains no identifiable faces.
-    -   **Rate** how clearly the photo suggests it was taken in {country}, and (if it does) **list the clues** that helped you decide.
-    -   **Rate** the popularity of the location captured.
-    -   **Select the city** where the photo was taken, and **pin the exact spot** on the map.
-    -   **Click** "Submit and Next" to move on.
+    -   **Select** the city / town where the photo was taken (or choose **"Other"** to type it if it isn't listed).
+    -   **Rate** how clearly the photo shows it was taken in {country}. If it shows such cues, **describe the clues** that would help someone identify the location (up to 200 words).
+    -   **Rate** how popular / well-known the location is.
+    -   **Pin the exact spot** where the image was taken on the map by searching for the location or clicking on it.
+    -   **Click** "Submit and Next" to move on to the next upload.
 
-After you upload a photo, wait for it to appear on screen before answering the questions. The entire activity would take around **20 minutes**. 
+This usually takes around **20 minutes**, but there's no strict deadline. After you upload a photo, wait for it to appear on screen before answering the questions.
 """, unsafe_allow_html=True)
 
 if not st.session_state.prolific_id:
@@ -142,7 +293,7 @@ if not st.session_state.prolific_id:
             else:
                 st.error("Please enter a valid Prolific ID, birth country and residence country.")
 else:
-    # --- MAIN APP LOGIC (runs only after Prolific ID is submitted) ---
+    # --- MAIN APP LOGIC ---
     if st.session_state.index < 10:
         idx = st.session_state.index
 
@@ -156,122 +307,103 @@ else:
             # getvalue() is non-destructive, so reruns (e.g. from the map) keep the bytes
             file_bytes = uploaded_file.getvalue()
             if len(file_bytes) < 100:
-                st.error("⚠️ File seems too small. Possible read error.")
+                st.error("File seems too small. Possible read error.")
             encoded_content = base64.b64encode(file_bytes).decode("utf-8")
             image = Image.open(BytesIO(file_bytes))
             st.image(image, use_container_width=True)
 
-            # ---- (4) Confirmations, immediately after the image ----
+            # ---- Confirmations, immediately after the image ----
             st.markdown("**Before answering, please confirm the following:**")
             confirm_outdoor = st.checkbox(
                 "I confirm this is an outdoor photo (it was not taken indoors).",
                 key=f"outdoor_{idx}",
             )
             confirm_faces = st.checkbox(
-                "I confirm this photo does not contain any identifiable faces or readable license plates.",
+                "I confirm this photo does not contain any identifiable faces.",
                 key=f"faces_{idx}",
             )
 
-            # ---- (5) Visual cues rating ----
-            clue_text = None
-            rating = st.radio(
-                f"**To what extent does this image contain visual cues (e.g., local architecture, language, or scenery) that identify it as being from {country}?**",
-                options=["Choose an option", 0, 1, 2, 3],
-                format_func=lambda x: f"{'No evidence at all' if x==0 else f'A few features that are shared by multiple countries within {continent}, but not fully specific to {country}' if x==2 else f'Enough evidence specific to {country}' if x==3 else f'There are visual indications like architectural style, vegetations, etc, but I do not know if they are specific to {country} or {continent}' if x==1 else ''}",
-                index=0,
-                key=f"rating_{idx}",
-            )
-
-            # Show the hints box for anything OTHER than "No evidence at all" (i.e. 1, 2, 3)
-            if rating in [1, 2, 3]:
-                clue_text = st.text_area(
-                    "Please describe **all** the visual clues in this photo that helped you identify the location"
-                    "— for example architecture, signage or language, vehicles, vegetation, clothing, terrain, etc."
-                    "A more detailed answer helps us a lot.",
-                    height=140,
-                    key=f"clues_{idx}",
-                )
-                word_count = len((clue_text or "").split())
-                st.caption(f"{word_count}/200 words — please keep your answer under 200 words.")
-                if word_count > 200:
-                    st.warning("⚠️ Your answer is over 200 words. Please shorten it before submitting.")
-
-            # ---- (6) Popularity (unchanged) ----
-            popularity = st.radio(
-                "**How would you rate the popularity of the location depicted in the photo you uploaded?**",
-                options=["Choose an option", 0, 1, 2],
-                format_func=lambda x: f"{'The location depicts only a regular scene' if x==0 else f'The location may be locally popular, but not country-wide' if x==1 else f'The location is popular country-wide' if x==2 else 'Choose an option'}",
-                index=0,
-                key=f"pop_{idx}",
-            )
-
-            # ---- (7) City search dropdown (GeoNames) with manual fallback ----
-            st.markdown(f"**Where in {country} was this photo taken?**")
+            # ---- City (required) — right after the confirmations ----
+            st.markdown(f"**Which city / town in {country} was this photo taken in?**")
             SELECT_PLACEHOLDER = "Select a city…"
-            OTHER_OPTION = "Other — my city/town is not in the list (I'll type it)"
-            city_options = [SELECT_PLACEHOLDER] + list(CITIES.keys()) + [OTHER_OPTION]
+            OTHER_OPTION = "✏️ Other — my city/town is NOT listed (type it myself)"
+            city_options = [SELECT_PLACEHOLDER, OTHER_OPTION] + CITY_NAMES
             city_choice = st.selectbox(
-                "Search and select the nearest city/town:",
+                "Choose the city / town (type to search):",
                 options=city_options,
                 index=0,
                 key=f"city_{idx}",
             )
+            st.caption(
+                "Can't find your city/town in the list? Pick **\"Other\"** (at the top) to type it in yourself."
+            )
 
             city_name = None
-            map_center = COUNTRY_CENTER
-            map_zoom = COUNTRY_ZOOM
-
             if city_choice == OTHER_OPTION:
                 typed = st.text_input("Type the city / town name:", key=f"city_other_{idx}")
                 city_name = typed.strip() if typed and typed.strip() else None
             elif city_choice != SELECT_PLACEHOLDER:
                 city_name = city_choice
-                map_center = CITIES[city_choice]
-                map_zoom = 11
 
-            # ---- (8) Optional interactive map to pin the exact spot ----
-            st.markdown(
-                "*(Optional)* Click on the map to drop a pin on the **exact** spot where the photo was taken. "
-                "The map centers on the city you selected above."
+            # ---- Visual cues rating (no option pre-selected) ----
+            clue_text = None
+            rating = st.radio(
+                f"**To what extent does this image contain visual cues (e.g., local architecture, language, or scenery) that identify it as being from {country}?**",
+                options=[0, 1, 2, 3],
+                format_func=fmt_rating,
+                index=None,
+                key=f"rating_{idx}",
             )
-            coords_key = f"coords_{idx}"
-            saved_coords = st.session_state.get(coords_key)
 
-            fmap = folium.Map(location=map_center, zoom_start=map_zoom)
-            if saved_coords:
-                folium.Marker(
-                    [saved_coords["lat"], saved_coords["lng"]],
-                    tooltip="Selected location",
-                ).add_to(fmap)
+            # Show the hints box for anything OTHER than "No evidence at all"
+            if rating in [1, 2, 3]:
+                clue_text = st.text_area(
+                    "Please describe **all** the visual clues in this photo that would help someone identify "
+                    "where it was taken — for example architecture, signage or language, vehicles, vegetation, "
+                    "clothing, terrain, etc. Please give a comprehensive answer in no more than 200 words.",
+                    height=140,
+                    key=f"clues_{idx}",
+                )
+                word_count = len((clue_text or "").split())
+                st.caption(f"{word_count}/200 words")
+                if word_count > 200:
+                    st.warning("Your answer is over 200 words. Please shorten it before submitting.")
 
-            map_data = st_folium(fmap, height=350, width=700, key=f"map_{idx}")
-            if map_data and map_data.get("last_clicked"):
-                lc = map_data["last_clicked"]
-                st.session_state[coords_key] = {"lat": lc["lat"], "lng": lc["lng"]}
+            # ---- Popularity (no option pre-selected) ----
+            popularity = st.radio(
+                "**How would you rate the popularity of the location depicted in the photo you uploaded?**",
+                options=[0, 1, 2],
+                format_func=fmt_pop,
+                index=None,
+                key=f"pop_{idx}",
+            )
 
-            coords = st.session_state.get(coords_key)
-            if coords:
+            # ---- Map (optional) — kept at the end, independent of the city field ----
+            st.markdown("**Pin the exact spot on the map** (optional)")
+            st.caption("Search for the place and/or click & drag the marker to the exact spot.")
+            picked = gmaps_picker(center=COUNTRY_CENTER, zoom=5, key=f"gmaps_{idx}")
+            if picked and "lat" in picked:
+                addr = picked.get("address") or ""
                 st.success(
-                    f"📍 Pinned location: Latitude {coords['lat']:.6f}, Longitude {coords['lng']:.6f}"
+                    f"📍 Pinned: {addr + '  ·  ' if addr else ''}"
+                    f"{picked['lat']:.6f}, {picked['lng']:.6f}"
                 )
 
             # ---- Submit ----
             if st.button("Submit and Next", key=f"submit_{idx}"):
-                # Validation
                 if not (confirm_outdoor and confirm_faces):
-                    st.error("Please tick both confirmation boxes (outdoor photo, no identifiable faces/plates).")
-                elif rating == "Choose an option":
+                    st.error("Please tick both confirmation boxes (outdoor photo, no identifiable faces).")
+                elif rating is None:
                     st.error("Please answer the visual-cues question.")
                 elif rating in [1, 2, 3] and (not clue_text or not clue_text.strip()):
-                    st.error("Please describe the visual clues that helped you identify the location.")
+                    st.error("Please describe the visual clues that would help someone identify the location.")
                 elif rating in [1, 2, 3] and len((clue_text or "").split()) > 200:
                     st.error("Your clues answer is over 200 words. Please shorten it.")
-                elif popularity == "Choose an option":
+                elif popularity is None:
                     st.error("Please answer the popularity question.")
                 elif not city_name:
                     st.error("Please select (or type) the city where the photo was taken.")
                 else:
-                    # Upload image to GitHub
                     file_name = f"{st.session_state.prolific_id}_{idx}.png"
                     file_path = f"{country}_images/{file_name}"
                     api_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{file_path}"
@@ -293,6 +425,10 @@ else:
                         st.error(f"Upload failed: {response.status_code}")
                         st.text(response.json())
 
+                    pin_coords = (
+                        {"lat": picked["lat"], "lng": picked["lng"]}
+                        if (picked and "lat" in picked) else None
+                    )
                     st.session_state.responses.append({
                         "name": st.session_state.prolific_id,
                         "birth_country": st.session_state.birth_country,
@@ -301,23 +437,36 @@ else:
                         "image_url": file_path,
                         "rating": rating,
                         "city": city_name,
-                        "coords": coords,  # may be None if they skipped the optional map pin
+                        "place_address": picked.get("address") if picked else None,
+                        "coords": pin_coords,  # None if they skipped the optional map pin
                         "popularity": popularity,
                         "clues": clue_text,
                     })
 
+                    # Save progress to Firestore after EVERY image (merge into the same
+                    # participant document), so partial / abandoned sessions are still captured.
+                    db.collection("Image_procurement").document(st.session_state.prolific_id).set({
+                        "prolific_id": st.session_state.prolific_id,
+                        "birth_country": st.session_state.birth_country,
+                        "country_of_residence": st.session_state.residence,
+                        "privacy": st.session_state.privacy,
+                        "timestamp": firestore.SERVER_TIMESTAMP,
+                        "num_images": len(st.session_state.responses),
+                        "completed": False,
+                        "responses": st.session_state.responses,
+                    }, merge=True)
+
                     st.session_state.index += 1
                     st.rerun()
     else:
-        doc_ref = db.collection("Image_procurement").document(st.session_state.prolific_id)
-        doc_ref.set({
-            "prolific_id": st.session_state.prolific_id,
-            "birth_country": st.session_state.birth_country,
-            "country_of_residence": st.session_state.residence,
-            "privacy": st.session_state.privacy,
-            "timestamp": firestore.SERVER_TIMESTAMP,
+        # All 10 done — responses were already saved after each image;
+        # just mark the session complete.
+        db.collection("Image_procurement").document(st.session_state.prolific_id).set({
             "responses": st.session_state.responses,
-        })
+            "num_images": len(st.session_state.responses),
+            "completed": True,
+            "completed_at": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
         st.session_state.submitted_all = True
         st.success("Survey complete. Thank you!")
         st.write("Survey complete! Thank you.")
