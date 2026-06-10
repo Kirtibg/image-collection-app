@@ -12,14 +12,44 @@ import tempfile
 import pathlib
 import geonamescache
 
-country = 'India'
-continent = 'Asia'
+
 
 firebase_secrets = st.secrets["firebase"]
 token = firebase_secrets["github_token"]
 repo_name = firebase_secrets["github_repo"]
 owner, repo_name = repo_name.split('/')
 maps_api_key = firebase_secrets["Maps_API_KEY"]  # add this under [firebase] in secrets
+
+# country = 'India'
+# continent = 'Asia'
+
+# COUNTRY CONFIG (driven by the URL ?country=<ISO2> parameter) 
+gc = geonamescache.GeonamesCache()
+_COUNTRIES = gc.get_countries()  # keyed by ISO-2 code: "DK", "NO", "IN", ...
+
+CONTINENT_NAMES = {
+    "AF": "Africa", "AS": "Asia", "EU": "Europe",
+    "NA": "North America", "SA": "South America",
+    "OC": "Oceania", "AN": "Antarctica",
+}
+
+
+COUNTRY_CENTERS = {
+    "DK": (56.0, 9.5),    # Denmark
+    "NO": (61.0, 9.0),    # southern Norway (where most people live)
+    "IN": (22.0, 79.0),   # India
+}
+
+COUNTRY_CODE = (st.query_params.get("country") or "DK").upper()
+_meta = _COUNTRIES.get(COUNTRY_CODE)
+if _meta is None:
+    st.error(f"Unknown country code '{COUNTRY_CODE}'. Add ?country=<ISO2> to the URL (e.g. ?country=DK).")
+    st.stop()
+
+country = _meta["name"]
+continent = CONTINENT_NAMES.get(_meta["continentcode"], _meta["continentcode"])
+
+
 
 # Convert secrets to dict
 cred_dict = {
@@ -41,8 +71,8 @@ if not firebase_admin._apps:
 
 db = firestore.client()
 
-# Rough country centroid used as the map's default center
-COUNTRY_CENTER = (22.0, 79.0)
+# # Rough country centroid used as the map's default center
+# COUNTRY_CENTER = (22.0, 79.0)
 
 
 # ---- CITY LIST (GeoNames via geonamescache) ----
@@ -59,8 +89,21 @@ def load_cities(cc):
                 data[name] = (float(c["latitude"]), float(c["longitude"]))
     return dict(sorted(data.items(), key=lambda x: x[0].lower()))
 
-CITIES = load_cities("IN")
+CITIES = load_cities(COUNTRY_CODE)
 CITY_NAMES = list(CITIES.keys())
+
+
+
+# Map center: explicit table, else mean of city coords, else (0,0)
+if COUNTRY_CODE in COUNTRY_CENTERS:
+    COUNTRY_CENTER = COUNTRY_CENTERS[COUNTRY_CODE]
+elif CITIES:
+    lats = [v[0] for v in CITIES.values()]
+    lngs = [v[1] for v in CITIES.values()]
+    COUNTRY_CENTER = (sum(lats) / len(lats), sum(lngs) / len(lngs))
+else:
+    COUNTRY_CENTER = (0.0, 0.0)
+
 
 
 # ---- GOOGLE MAPS PICKER (optional, bidirectional custom component) ----
@@ -126,7 +169,7 @@ _GMAPS_HTML_TEMPLATE = r"""<!DOCTYPE html>
   function doSearch() {
     var q = document.getElementById("search").value;
     if (!q) return;
-    geocoder.geocode({ address: q, componentRestrictions: { country: "IN" } }, function (results, status) {
+    geocoder.geocode({ address: q, componentRestrictions: { country: "__CC__" } }, function (results, status) {
       if (status === "OK" && results[0]) {
         var loc = results[0].geometry.location;
         if (results[0].geometry.viewport) map.fitBounds(results[0].geometry.viewport);
@@ -188,15 +231,16 @@ _GMAPS_HTML_TEMPLATE = r"""<!DOCTYPE html>
 </html>
 """
 
-_COMPONENT_DIR = pathlib.Path(tempfile.gettempdir()) / "gmaps_picker_component"
+_COMPONENT_DIR = pathlib.Path(tempfile.gettempdir()) / f"gmaps_picker_{COUNTRY_CODE}"
 _COMPONENT_DIR.mkdir(exist_ok=True)
 _html = (_GMAPS_HTML_TEMPLATE
          .replace("__API_KEY__", maps_api_key)
+         .replace("__CC__", COUNTRY_CODE)
          .replace("__LAT__", str(COUNTRY_CENTER[0]))
          .replace("__LNG__", str(COUNTRY_CENTER[1])))
 (_COMPONENT_DIR / "index.html").write_text(_html, encoding="utf-8")
 
-_gmaps_component = components.declare_component("gmaps_picker", path=str(_COMPONENT_DIR))
+_gmaps_component = components.declare_component(f"gmaps_picker_{COUNTRY_CODE}", path=str(_COMPONENT_DIR))
 
 def gmaps_picker(center, zoom, key):
     """center=(lat,lng). Returns {'lat','lng','address'} once a spot is set, else None."""
