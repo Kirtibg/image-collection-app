@@ -8,6 +8,7 @@ import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import firestore
 import requests
+import zipfile
 import tempfile
 import pathlib
 import geonamescache
@@ -18,14 +19,14 @@ firebase_secrets = st.secrets["firebase"]
 token = firebase_secrets["github_token"]
 repo_name = firebase_secrets["github_repo"]
 owner, repo_name = repo_name.split('/')
-maps_api_key = firebase_secrets["Maps_API_KEY"]  
+maps_api_key = firebase_secrets["Maps_API_KEY"]
+
+MIN_IMAGES = 10
+MAX_IMAGES = 30
+
+MIN_CITY_POP = 500
 
 
-MIN_IMAGES = 10  
-MAX_IMAGES = 30   
-
-# Your Prolific completion code. Either set `prolific_completion_code` under
-# [firebase] in your secrets, or replace the fallback string below.
 PROLIFIC_COMPLETION_CODE = firebase_secrets.get(
     "prolific_completion_code", "REPLACE_WITH_YOUR_PROLIFIC_CODE"
 )
@@ -33,7 +34,6 @@ PROLIFIC_COMPLETION_CODE = firebase_secrets.get(
 # country = 'India'
 # continent = 'Asia'
 
-# COUNTRY CONFIG (driven by the URL ?country=<ISO2> parameter) 
 gc = geonamescache.GeonamesCache()
 _COUNTRIES = gc.get_countries()  # keyed by ISO-2 code: "DK", "NO", "IN", ...
 
@@ -85,10 +85,52 @@ db = firestore.client()
 # COUNTRY_CENTER = (22.0, 79.0)
 
 
-# ---- CITY LIST (GeoNames via geonamescache) ----
-@st.cache_data(show_spinner=False)
+# ---- CITY LIST (full GeoNames per-country dump, with geonamescache fallback) ----
+@st.cache_data(show_spinner="Loading the list of cities/towns…", ttl=24 * 3600)
 def load_cities(cc):
-    """Return {city_name: (lat, lng)} for the given country code, sorted by name."""
+    """Return {place_name: (lat, lng)} for the given country code, sorted by name.
+
+    Uses GeoNames' full per-country dump (all populated places) so that small
+    towns/villages are included. Falls back to the geonamescache bundled list
+    (population > 15,000 only) if the download fails.
+    """
+    # Feature codes we treat as "a place a participant might name".
+    KEEP_CODES = {
+        "PPL", "PPLA", "PPLA2", "PPLA3", "PPLA4", "PPLA5",
+        "PPLC", "PPLG", "PPLL", "PPLS", "PPLX",
+    }
+    url = f"https://download.geonames.org/export/dump/{cc}.zip"
+    try:
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+        tmp = {}  # name -> (lat, lng, pop)
+        with zipfile.ZipFile(BytesIO(resp.content)) as zf:
+            with zf.open(f"{cc}.txt") as fh:
+                for raw in fh:
+                    parts = raw.decode("utf-8").rstrip("\n").split("\t")
+                    if len(parts) < 15:
+                        continue
+                    # GeoNames columns: 1=name 4=lat 5=lng 6=feat_class 7=feat_code 14=pop
+                    if parts[6] != "P" or parts[7] not in KEEP_CODES:
+                        continue
+                    name = parts[1]
+                    try:
+                        lat, lng = float(parts[4]), float(parts[5])
+                    except ValueError:
+                        continue
+                    pop = int(parts[14]) if parts[14].isdigit() else 0
+                    if pop < MIN_CITY_POP:
+                        continue
+                    # On duplicate names, keep the most populous one.
+                    if name not in tmp or pop > tmp[name][2]:
+                        tmp[name] = (lat, lng, pop)
+        if tmp:
+            data = {k: (v[0], v[1]) for k, v in tmp.items()}
+            return dict(sorted(data.items(), key=lambda x: x[0].lower()))
+    except Exception:
+        pass  # fall through to the bundled list below
+
+    # ---- Fallback: geonamescache bundled cities (population > 15,000) ----
     gc = geonamescache.GeonamesCache()
     cities = gc.get_cities()
     data = {}
@@ -429,12 +471,12 @@ else:
             )
 
             # ---- City (required) — right after the confirmations ----
-            st.markdown(f"**Which city / town in {country} was this photo taken in?**")
+            st.markdown(f"**Which city/town in {country} was this photo taken in?**")
             SELECT_PLACEHOLDER = "Select a city…"
             OTHER_OPTION = "✏️ Other — my city/town is NOT listed (type it myself)"
             city_options = [SELECT_PLACEHOLDER, OTHER_OPTION] + CITY_NAMES
             city_choice = st.selectbox(
-                "Choose the city / town (type to search):",
+                "Choose the city/town (type to search):",
                 options=city_options,
                 index=0,
                 key=f"city_{idx}",
@@ -445,7 +487,7 @@ else:
 
             city_name = None
             if city_choice == OTHER_OPTION:
-                typed = st.text_input("Type the city / town name:", key=f"city_other_{idx}")
+                typed = st.text_input("Type the city/town name:", key=f"city_other_{idx}")
                 city_name = typed.strip() if typed and typed.strip() else None
             elif city_choice != SELECT_PLACEHOLDER:
                 city_name = city_choice
