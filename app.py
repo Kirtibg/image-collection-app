@@ -18,13 +18,17 @@ firebase_secrets = st.secrets["firebase"]
 token = firebase_secrets["github_token"]
 repo_name = firebase_secrets["github_repo"]
 owner, repo_name = repo_name.split('/')
-maps_api_key = firebase_secrets["Maps_API_KEY"] 
+maps_api_key = firebase_secrets["Maps_API_KEY"]  
 
 
 MIN_IMAGES = 10  
 MAX_IMAGES = 30   
 
-PROLIFIC_COMPLETION_CODE = firebase_secrets["prolific_completion_code"]
+# Your Prolific completion code. Either set `prolific_completion_code` under
+# [firebase] in your secrets, or replace the fallback string below.
+PROLIFIC_COMPLETION_CODE = firebase_secrets.get(
+    "prolific_completion_code", "REPLACE_WITH_YOUR_PROLIFIC_CODE"
+)
 
 # country = 'India'
 # continent = 'Asia'
@@ -136,7 +140,7 @@ _GMAPS_HTML_TEMPLATE = r"""<!DOCTYPE html>
     <button id="searchBtn">Search</button>
   </div>
   <div id="map"></div>
-  <div id="info">Search above, or click / drag the marker to set the exact spot.</div>
+  <div id="info">Search above, or click/drag the marker to set the exact spot.</div>
 
 <script>
   function _send(type, data) {
@@ -256,6 +260,35 @@ def gmaps_picker(center, zoom, key):
         zoom=zoom,
         key=key,
     )
+
+
+# ---- GITHUB UPLOAD (overwrite-safe + clearer errors) ----
+def upload_image_to_github(file_path, content_b64):
+    """PUT an image to the repo. If the path already exists (e.g. the participant
+    refreshed and restarted), GitHub needs the existing blob's sha to overwrite it."""
+    api_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{file_path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+
+    sha = None
+    try:
+        get_resp = requests.get(api_url, headers=headers, params={"ref": "main"}, timeout=30)
+        if get_resp.status_code == 200:
+            sha = get_resp.json().get("sha")
+    except requests.RequestException:
+        pass  # network hiccup on the existence check; the PUT below will report any real error
+
+    payload = {
+        "message": f"Upload {file_path}",
+        "content": content_b64,
+        "branch": "main",
+    }
+    if sha:
+        payload["sha"] = sha
+
+    return requests.put(api_url, headers=headers, json=payload, timeout=60)
 
 
 # ---- Radio label helpers ----
@@ -478,24 +511,16 @@ else:
                 else:
                     file_name = f"{st.session_state.prolific_id}_{idx}.png"
                     file_path = f"{country}_images/{file_name}"
-                    api_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{file_path}"
+                    response = upload_image_to_github(file_path, encoded_content)
+                    if response.status_code not in [200, 201]:
+                        try:
+                            detail = response.json().get("message", response.text)
+                        except Exception:
+                            detail = response.text
+                        st.error(f"Upload failed ({response.status_code}): {detail}")
+                        st.stop()  # don't record/advance on a failed upload
 
-                    headers = {
-                        "Authorization": f"Bearer {token}",
-                        "Accept": "application/vnd.github.v3+json",
-                    }
-                    payload = {
-                        "message": f"Upload {file_path}",
-                        "content": encoded_content,
-                        "branch": "main",
-                    }
-
-                    response = requests.put(api_url, headers=headers, json=payload)
-                    if response.status_code in [200, 201]:
-                        st.success("Image uploaded to GitHub successfully.")
-                    else:
-                        st.error(f"Upload failed: {response.status_code}")
-                        st.text(response.json())
+                    st.success("Image uploaded to GitHub successfully.")
 
                     pin_coords = (
                         {"lat": picked["lat"], "lng": picked["lng"]}
