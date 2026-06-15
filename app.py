@@ -18,7 +18,13 @@ firebase_secrets = st.secrets["firebase"]
 token = firebase_secrets["github_token"]
 repo_name = firebase_secrets["github_repo"]
 owner, repo_name = repo_name.split('/')
-maps_api_key = firebase_secrets["Maps_API_KEY"]  # add this under [firebase] in secrets
+maps_api_key = firebase_secrets["Maps_API_KEY"] 
+
+
+MIN_IMAGES = 10  
+MAX_IMAGES = 30   
+
+PROLIFIC_COMPLETION_CODE = firebase_secrets["prolific_completion_code"]
 
 # country = 'India'
 # continent = 'Asia'
@@ -277,6 +283,9 @@ if "index" not in st.session_state:
 if "prolific_id" not in st.session_state:
     st.session_state.prolific_id = None
 
+if "finished" not in st.session_state:
+    st.session_state.finished = False
+
 
 # ---- UI ----
 st.title(f"Image Collection from {country}")
@@ -300,15 +309,16 @@ Following are the instructions for the same.
 -   Try to upload images that represent diverse locations or settings.
 
 **What to do:**
-1.  **Upload 10 images**, one at a time.
+1.  **Upload at least {MIN_IMAGES} images**, one at a time. After the required {MIN_IMAGES}, you may *optionally* keep uploading up to **{MAX_IMAGES} images** in total.
 2.  For each image:
     -   Wait for the photo to appear on screen.
     -   **Confirm** that the photo is outdoors and contains no identifiable faces.
-    -   **Select** the city / town where the photo was taken (or choose **"Other"** to type it if it isn't listed).
+    -   **Select** the city/town where the photo was taken (or choose **"Other"** to type it if it isn't listed).
     -   **Rate** how clearly the photo shows it was taken in {country}. If it shows such cues, **describe the clues** that would help someone identify the location (up to 200 words).
-    -   **Rate** how popular / well-known the location is.
+    -   **Rate** how popular/well-known the location is.
     -   **Pin the exact spot** where the image was taken on the map by searching for the location or clicking on it.
     -   **Click** "Submit and Next" to move on to the next upload.
+3.  Once you've uploaded the required {MIN_IMAGES}, a **"Finish the survey"** button appears. Click it whenever you're done to receive your **Prolific completion code**.
 
 This usually takes around **20 minutes**, but there's no strict deadline. After you upload a photo, wait for it to appear on screen before answering the questions.
 """, unsafe_allow_html=True)
@@ -338,11 +348,29 @@ if not st.session_state.prolific_id:
                 st.error("Please enter a valid Prolific ID, birth country and residence country.")
 else:
     # --- MAIN APP LOGIC ---
-    if st.session_state.index < 10:
+    # The participant is "done" if they reached the max, or chose to finish
+    # after meeting the minimum.
+    done = st.session_state.finished or (st.session_state.index >= MAX_IMAGES)
+
+    if not done:
         idx = st.session_state.index
 
+        # ---- Progress + (after the required minimum) a Finish button ----
+        if idx < MIN_IMAGES:
+            st.progress(idx / MIN_IMAGES,
+                        text=f"{idx} of {MIN_IMAGES} required images uploaded")
+        else:
+            st.progress(1.0, text=f"{idx} images uploaded — minimum of {MIN_IMAGES} reached ✅")
+            st.info(
+                f"You've uploaded the required {MIN_IMAGES} images. "
+                f"You're welcome to add more (up to {MAX_IMAGES} total), or finish now."
+            )
+            if st.button("✅ I'm done — finish the survey and get my completion code"):
+                st.session_state.finished = True
+                st.rerun()
+
         uploaded_file = st.file_uploader(
-            f"Upload image {idx + 1}",
+            f"Upload image {idx + 1}" + ("" if idx < MIN_IMAGES else " (optional)"),
             type=["jpg", "jpeg", "png"],
             key=f"file_{idx}",
         )
@@ -503,8 +531,9 @@ else:
                     st.session_state.index += 1
                     st.rerun()
     else:
-        # All 10 done — responses were already saved after each image;
-        # just mark the session complete.
+        # Finished — either the participant reached MAX_IMAGES, or they chose to
+        # stop after meeting MIN_IMAGES. Responses were already saved after each
+        # image; just mark the session complete and show the completion code.
         db.collection("Image_procurement").document(st.session_state.prolific_id).set({
             "responses": st.session_state.responses,
             "num_images": len(st.session_state.responses),
@@ -512,5 +541,20 @@ else:
             "completed_at": firestore.SERVER_TIMESTAMP,
         }, merge=True)
         st.session_state.submitted_all = True
+
         st.success("Survey complete. Thank you!")
-        st.write("Survey complete! Thank you.")
+        st.markdown("### 🎉 You're all done!")
+        st.write(
+            f"You uploaded **{len(st.session_state.responses)}** images. "
+            "Thank you for contributing to our research."
+        )
+        st.markdown("Your **Prolific completion code** is:")
+        st.markdown(f"## `{PROLIFIC_COMPLETION_CODE}`")
+        st.markdown(
+            "Please copy this code back into Prolific to register your submission, "
+            "or use the button below to return to Prolific automatically."
+        )
+        st.link_button(
+            "↩️ Return to Prolific and submit",
+            f"https://app.prolific.com/submissions/complete?cc={PROLIFIC_COMPLETION_CODE}",
+        )
